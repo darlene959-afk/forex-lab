@@ -36,7 +36,13 @@ st.title("Forex Lab — MT5 Data + Strategy Library")
 conn = connect(DB_PATH)
 init_db(conn)
 
-tab1, tab2, tab3 = st.tabs(["Upload Market Data", "Upload Strategy PDF/DOCX", "Database Overview"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Upload Market Data",
+    "Upload Strategy PDF/DOCX",
+    "Database Overview",
+    "Strategy Viewer",
+    "Backtest"
+])
 
 with tab1:
     st.subheader("Upload MT5 CSV files")
@@ -161,6 +167,30 @@ with tab2:
                 st.success("Strategy deleted.")
                 st.rerun()
 with tab3:
+    import datetime
+    from db import backup_db
+    import shutil
+
+    st.subheader("Backup database")
+
+    backup_name = f"forex_backup_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db"
+    backup_path = backup_name
+
+    if st.button("Create backup now"):
+        try:
+            # Make sure DB is flushed/closed before backup call
+            conn.close()
+            backup_db(DB_PATH, backup_path)
+            # Re-open for rest of app
+            conn = connect(DB_PATH)
+            init_db(conn)
+
+            with open(backup_path, "rb") as f:
+                st.download_button("Download backup file", data=f, file_name=backup_name)
+            st.success("Backup created.")
+        except Exception as e:
+            st.error(f"Backup failed: {e}")
+
     st.subheader("What’s in the database?")
 
     # Coverage
@@ -173,8 +203,8 @@ with tab3:
 
     if not cov.empty:
         # Show display-time conversions
-        cov["start_est"] = utc_to_display(pd.to_datetime(cov["utc_start"])).dt.strftime("%Y-%m-%d %H:%M")
-        cov["end_est"] = utc_to_display(pd.to_datetime(cov["utc_end"])).dt.strftime("%Y-%m-%d %H:%M")
+        cov["start_est"] = utc_to_display(pd.to_datetime(cov["utc_start"])) .dt.strftime("%Y-%m-%d %H:%M")
+        cov["end_est"] = utc_to_display(pd.to_datetime(cov["utc_end"])) .dt.strftime("%Y-%m-%d %H:%M")
         st.dataframe(cov, use_container_width=True)
     else:
         st.info("No bars imported yet.")
@@ -197,5 +227,139 @@ with tab3:
         LIMIT 50
     """, conn)
     st.dataframe(sf, use_container_width=True)
+
+with tab4:
+    st.subheader("Strategy Viewer")
+    st.caption("View the extracted text stored for each uploaded strategy (PDF/DOCX).")
+
+    # Load strategies from DB
+    strat_rows = conn.execute("""
+        SELECT strategy_file_id, name, filename, file_type, uploaded_at_utc,
+               COALESCE(LENGTH(extracted_text), 0) AS extracted_chars
+        FROM strategy_files
+        ORDER BY strategy_file_id DESC
+    """).fetchall()
+
+    if not strat_rows:
+        st.info("No strategies found yet. Upload one in the 'Upload Strategy PDF/DOCX' tab.")
+    else:
+        options = [
+            (r[0], f"ID {r[0]} — {r[1]} — {r[2]} ({r[3]}) — uploaded {r[4]} — {r[5]} chars")
+            for r in strat_rows
+        ]
+
+        selected = st.selectbox(
+            "Select a strategy to view",
+            options=options,
+            format_func=lambda x: x[1]
+        )
+
+        strategy_id = int(selected[0])
+
+        row = conn.execute("""
+            SELECT strategy_file_id, name, filename, file_type, uploaded_at_utc, extracted_text
+            FROM strategy_files
+            WHERE strategy_file_id = ?
+        """, (strategy_id,)).fetchone()
+
+        st.markdown(f"**Name:** {row[1]}")
+        st.markdown(f"**File:** {row[2]} ({row[3]})")
+        st.markdown(f"**Uploaded (UTC):** {row[4]}")
+
+        text = row[5] or ""
+        if not text.strip():
+            st.warning("No extracted text found for this file (PDF may be image-only).")
+        else:
+            st.markdown("### Extracted text")
+            st.text_area("",
+                         value=text,
+                         height=500)
+
+            # Download extracted text
+            st.download_button(
+                label="Download extracted text (.txt)",
+                data=text.encode("utf-8"),
+                file_name=f"strategy_{strategy_id}_{row[1].replace(' ','_')}.txt",
+                mime="text/plain"
+            )
+
+with tab5:
+    st.subheader("Backtest (Phase 1: signal-driven, no hard-coded detector)")
+    st.caption("Upload a signals CSV with entry timestamp + entry price + initial stop. All results are computed from SQLite bar data.")
+
+    st.markdown("### Upload signals CSV")
+    st.caption("CSV must include: strategy_name, symbol, entry_tf, entry_price, stop_price, and either entry_ts_est (preferred) or entry_ts_utc.")
+    sig_file = st.file_uploader("Signals CSV", type=["csv"], accept_multiple_files=False, key="signals_upload")
+
+    if sig_file is not None:
+        import pandas as pd
+        from io import BytesIO
+        df = pd.read_csv(BytesIO(sig_file.getvalue()))
+        
+        import pytz
+
+        times_entered_in_est = st.checkbox("My timestamps are entered in EST/EDT (America/New_York). Convert to UTC automatically.",
+        value=True)
+
+        def est_to_utc_str(ts_str: str) -> str:
+            """
+            Convert 'YYYY-MM-DD HH:MM:SS' entered in America/New_York to UTC string.
+            Handles DST using tz rules.
+            """
+            ny = pytz.timezone("America/New_York")
+            utc = pytz.UTC
+
+            dt = pd.to_datetime(ts_str, errors="coerce")
+            if pd.isna(dt):
+                raise ValueError(f"Bad timestamp: {ts_str}")
+
+            # localize to NY time, then convert to UTC
+            dt_local = ny.localize(dt.to_pydatetime(), is_dst=None)  # raises if ambiguous
+            dt_utc = dt_local.astimezone(utc).replace(tzinfo=None)
+
+            return dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+        #required = {"strategy_name","symbol","entry_tf","entry_ts_utc","entry_price","stop_price"}
+        required_base = {"strategy_name","symbol","entry_tf","entry_price","stop_price"}
+        has_est = "entry_ts_est" in df.columns
+        has_utc = "entry_ts_utc" in df.columns
+        missing_base = required_base - set(df.columns)
+
+        if missing_base:
+            st.error(f"Missing required columns: {sorted(list(missing_base))}")
+        elif not (has_est or has_utc):
+            st.error("Missing timestamp column. Provide either 'entry_ts_est' (preferred) or 'entry_ts_utc'.")
+        else:
+            pass  # continue
+
+        missing = required_base - set(df.columns)
+        if missing:
+            st.error(f"Missing required columns: {sorted(list(missing))}")
+        else:
+            # Insert into signals_v2 (dedupe by exact timestamp per strategy/symbol/tf)
+            rows = []
+            for _, r in df.iterrows():
+                ts_input = str(r["entry_ts_est"]) if "entry_ts_est" in df.columns else str(r["entry_ts_utc"])
+                ts_utc = est_to_utc_str(ts_input) if times_entered_in_est else ts_input
+
+                rows.append((
+                    str(r["strategy_name"]),
+                    str(r["symbol"]),
+                    str(r["entry_tf"]),
+                    ts_utc,
+                    float(r["entry_price"]),
+                    float(r["stop_price"]),
+                    str(r.get("notes",""))
+                ))
+            
+            conn.executemany("""
+                INSERT INTO signals_v2(strategy_name,symbol,entry_tf,entry_ts_utc,entry_price,stop_price,notes)
+                VALUES (?,?,?,?,?,?,?)
+            """, rows)
+            conn.commit()
+            st.success(f"Inserted {len(rows)} signals into signals_v2.")
+
+    st.markdown("### Next")
+    st.info("Next step: wire the Bear Rally exit grid (BE on touch + PSAR trail on 15m + targets + time exits), using these stored signals.")
 
 conn.close()

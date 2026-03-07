@@ -45,6 +45,32 @@ CREATE TABLE IF NOT EXISTS strategy_files (
   extracted_text   TEXT,
   uploaded_at_utc  TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS signals (
+  signal_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+  strategy_name TEXT NOT NULL,
+  symbol       TEXT NOT NULL,
+  entry_tf     TEXT NOT NULL,
+  entry_ts_utc TEXT NOT NULL,    -- ISO UTC timestamp
+  notes        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_signals_lookup
+ON signals(strategy_name, symbol, entry_tf, entry_ts_utc);
+
+CREATE TABLE IF NOT EXISTS signals_v2 (
+  signal_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  strategy_name TEXT NOT NULL,
+  symbol        TEXT NOT NULL,
+  entry_tf      TEXT NOT NULL,
+  entry_ts_utc  TEXT NOT NULL,
+  entry_price   REAL NOT NULL,
+  stop_price    REAL NOT NULL,
+  notes         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_signals_v2_lookup
+ON signals_v2(strategy_name, symbol, entry_tf, entry_ts_utc);
 """
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -56,3 +82,12 @@ def connect(db_path: str) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     conn.commit()
+
+def backup_db(db_path: str, backup_path: str) -> None:
+    import sqlite3
+    src = sqlite3.connect(db_path)
+    dst = sqlite3.connect(backup_path)
+    with dst:
+        src.backup(dst)
+    dst.close()
+    src.close()

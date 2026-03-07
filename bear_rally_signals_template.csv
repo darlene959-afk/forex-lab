@@ -1,0 +1,3 @@
+strategy_name,symbol,entry_tf,entry_ts_utc,entry_price,stop_price,notes
+Bear Rally,EURUSD,1H,2025-12-01 14:00:00,1.05820,1.06110,"Example only - replace with real entry/stop"
+Bear Rally,EURUSD,1H,2025-12-03 09:00:00,1.05240,1.05530,"Example only - replace with real entry/stop"
