@@ -282,84 +282,393 @@ with tab4:
                 file_name=f"strategy_{strategy_id}_{row[1].replace(' ','_')}.txt",
                 mime="text/plain"
             )
+        import json
+        import datetime
+
+        st.divider()
+        st.subheader("Strategy Spec (machine-readable)")
+
+        st.caption("This turns the uploaded strategy text into a structured spec. Review/edit before saving. No hard-coded logic—this spec becomes the source of truth.")
+
+        default_spec_name = f"{row[1]} v1"
+        # Apply pending load before widgets render
+        pending = st.session_state.get(f"pending_spec_load_{strategy_id}")
+        if pending:
+            st.session_state[f"spec_json_{strategy_id}"] = pending["spec_json"]
+            st.session_state[f"spec_name_{strategy_id}"] = pending["spec_name"]
+            st.session_state[f"spec_id_{strategy_id}"] = pending["spec_id"]
+            del st.session_state[f"pending_spec_load_{strategy_id}"]
+      
+        spec_name_key = f"spec_name_{strategy_id}"
+        if spec_name_key not in st.session_state:
+            st.session_state[spec_name_key] = default_spec_name
+
+        spec_name = st.text_input("Spec name", key=spec_name_key)
+
+        # Draft spec generated from extracted text (lightweight, transparent)
+        # We store the extracted text reference in the spec so it's auditable.
+        draft = {
+            "strategy_name": row[1],
+            "source_strategy_file_id": strategy_id,
+            "source_filename": row[2],
+            "created_from_extracted_text": True,
+            "assumptions": {
+                "execution": "touch",
+                "both_hit_resolution": "use 1m then 5m; else stop-first",
+                "display_timezone": "America/New_York"
+            },
+            "indicator_defaults": {
+                "psar": {"step": 0.02, "max": 0.2, "source": "TradingView defaults (per uploaded settings)"},
+                "cci": {"length": 20, "smoothing": "raw"},
+                "atr": {"length": 14, "ma": "RMA"}
+            },
+            "rules_text_snippets": {
+                "full_extracted_text": (row[5] or "")[:20000]  # store first 20k chars for traceability
+            },
+            "strategy_fields": {
+                "entry_timeframe": "1H",
+                "trail_timeframe": "15m",
+                "be_move": {
+                    "trigger_type": "touch",
+                    "candidates_r": [0.5, 1.0]
+                },
+                "trailing_stop": {
+                    "type": "psar",
+                    "timeframe": "15m",
+                    "side": "above_price"
+                },
+                "entry_trigger_definition": "FROM_PDF_TEXT",
+                "initial_stop_definition": "FROM_PDF_TEXT"
+            }
+        }
+
+        st.caption("Edit the JSON below as needed. For now, entry/stop definitions will be filled next after we tag the exact lines in the PDF text.")
+        st.caption("Tip: Loaded specs are auto-formatted for readability. You can edit and re-save as a new version.")
+        # ---- Load an existing saved spec into the JSON editor ----
+        saved_specs = conn.execute("""
+            SELECT spec_id, spec_name, created_at_utc
+            FROM strategy_specs
+            WHERE strategy_file_id=?
+            ORDER BY spec_id DESC
+        """, (strategy_id,)).fetchall()
+
+        if saved_specs:
+            st.markdown("### Load an existing spec")
+            opt = [(r[0], f"spec_id {r[0]} — {r[1]} ({r[2]} UTC)") for r in saved_specs]
+            chosen_spec = st.selectbox("Choose saved spec to load", opt, format_func=lambda x: x[1], key=f"load_spec_{strategy_id}")
+            if st.button("Load selected spec into editor", key=f"btn_load_spec_{strategy_id}"):
+                spec_id_to_load = int(chosen_spec[0])
+                row_spec = conn.execute(
+                    "SELECT spec_json, spec_name FROM strategy_specs WHERE spec_id=?",
+                    (spec_id_to_load,)
+                ).fetchone()
+
+                if row_spec:
+                    st.session_state[f"pending_spec_load_{strategy_id}"] = {
+                        "spec_id": spec_id_to_load, 
+                        "spec_json": json.dumps(json.loads(row_spec[0]), indent=2),
+                        "spec_name": row_spec[1]
+                    }
+                    st.rerun()
+                else:
+                    st.error("Could not load that spec_id.")
+
+
+        else:
+            st.info("No saved specs yet for this strategy file.")
+
+
+        spec_json_key = f"spec_json_{strategy_id}"
+
+        # Seed once (only if nothing is loaded yet)
+        if spec_json_key not in st.session_state:
+            st.session_state[spec_json_key] = json.dumps(draft, indent=2)
+
+        spec_json_str = st.text_area(
+            "Spec JSON",
+            height=400,
+            key=spec_json_key
+        )
+
+
+        # Save spec
+        if st.button("Save spec", key=f"save_spec_{strategy_id}"):
+            try:
+                parsed = json.loads(spec_json_str)  # validate JSON
+                now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+                conn.execute("""
+                    INSERT INTO strategy_specs(strategy_file_id, spec_name, spec_json, created_at_utc)
+                    VALUES (?,?,?,?)
+                """, (strategy_id, spec_name.strip(), json.dumps(parsed), now_utc))
+                conn.commit()
+
+                st.success("Spec saved.")
+            except Exception as e:
+                st.error(f"Could not save spec: {e}")
+
+        # Show existing specs for this strategy file
+        specs = conn.execute("""
+            SELECT spec_id, spec_name, created_at_utc
+            FROM strategy_specs
+            WHERE strategy_file_id=?
+            ORDER BY spec_id DESC
+        """, (strategy_id,)).fetchall()
+
+        if specs:
+            st.markdown("### Saved specs")
+            st.dataframe(pd.DataFrame(specs, columns=["spec_id","spec_name","created_at_utc"]), use_container_width=True)
+        else:
+            st.info("No specs saved yet for this strategy.")
 
 with tab5:
-    st.subheader("Backtest (Phase 1: signal-driven, no hard-coded detector)")
-    st.caption("Upload a signals CSV with entry timestamp + entry price + initial stop. All results are computed from SQLite bar data.")
+    import pandas as pd
+    from backtest_engine import run_bear_rally_backtest
 
-    st.markdown("### Upload signals CSV")
-    st.caption("CSV must include: strategy_name, symbol, entry_tf, entry_price, stop_price, and either entry_ts_est (preferred) or entry_ts_utc.")
-    sig_file = st.file_uploader("Signals CSV", type=["csv"], accept_multiple_files=False, key="signals_upload")
+  
+    # Select spec (for now we use it as the record of settings/version)
+    specs = conn.execute("""
+        SELECT s.spec_id, s.spec_name, f.name, f.filename
+        FROM strategy_specs s
+        JOIN strategy_files f ON f.strategy_file_id = s.strategy_file_id
+        ORDER BY s.spec_id DESC
+    """).fetchall()
 
-    if sig_file is not None:
-        import pandas as pd
-        from io import BytesIO
-        df = pd.read_csv(BytesIO(sig_file.getvalue()))
+    if not specs:
+        st.warning("No strategy specs found. Save a spec in Strategy Viewer first.")
+    else:
+        spec_opt = [(r[0], f"spec_id {r[0]} — {r[1]} (file: {r[3]})") for r in specs]
+        chosen = st.selectbox("Choose strategy spec", spec_opt, format_func=lambda x: x[1])
+        spec_id = int(chosen[0])
+
+        import json
+        spec_row = conn.execute(
+            "SELECT spec_json FROM strategy_specs WHERE spec_id=?",
+            (spec_id,)
+        ).fetchone()
+
+        if spec_row is None:
+            st.error("Selected spec_id not found in strategy_specs.")
+            st.stop()
+
+        spec = json.loads(spec_row[0])
         
-        import pytz
+        st.subheader("Backtest — Bear Rally (from selected spec)")
 
-        times_entered_in_est = st.checkbox("My timestamps are entered in EST/EDT (America/New_York). Convert to UTC automatically.",
-        value=True)
+        entry_tf = spec["strategy_fields"]["entry_timeframe"]
+        trail_tf = spec["strategy_fields"]["trail_timeframe"]
+        trigger_tf = spec["strategy_fields"]["trigger"].get("timeframe", "CURRENT")
+        be_levels = spec["strategy_fields"]["be_move"]["candidates_r"]
+        targets = spec["strategy_fields"]["targets"]["tested_target_r"]
+        time_exits = spec["strategy_fields"]["time_exits"]["entry_tf_bars"]
 
-        def est_to_utc_str(ts_str: str) -> str:
-            """
-            Convert 'YYYY-MM-DD HH:MM:SS' entered in America/New_York to UTC string.
-            Handles DST using tz rules.
-            """
-            ny = pytz.timezone("America/New_York")
-            utc = pytz.UTC
+        st.caption(
+            f"Entry: after trigger close ({entry_tf}). "
+            f"Trigger: PSAR close-break short on {trigger_tf}. "
+            f"Stop: above most recent pivot high before trigger. "
+            f"After BE (touch @ {be_levels}R), trail above PSAR on {trail_tf}. "
+            f"Targets tested: {targets}R. "
+            f"Max hold (bars): {time_exits}. "
+            f"Stops/targets execute on touch; same-bar resolved via 1m→5m→stop-first."
+        )
+        # Pair selection
+        symbol = st.selectbox("Symbol", ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"], index=0)
 
-            dt = pd.to_datetime(ts_str, errors="coerce")
-            if pd.isna(dt):
-                raise ValueError(f"Bad timestamp: {ts_str}")
+        from backtest_engine import count_bear_rally_setups_all
 
-            # localize to NY time, then convert to UTC
-            dt_local = ny.localize(dt.to_pydatetime(), is_dst=None)  # raises if ambiguous
-            dt_utc = dt_local.astimezone(utc).replace(tzinfo=None)
+        # ---- Count button ----
+        if st.button("Count all Bear Rally setups in full dataset window"):
+            try:
+                cnt, s_utc, e_utc = count_bear_rally_setups_all(conn, symbol, spec)
+                st.session_state["last_count"] = {
+                    "cnt": cnt, "s": s_utc, "e": e_utc,
+                    "symbol": symbol, "spec_id": spec_id
+                }
+            except Exception as e:
+                st.error(f"Count failed: {e}")
 
-            return dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+        # ---- Persisted count display (always) ----
+        lc = st.session_state.get("last_count")
+        if lc and lc["symbol"] == symbol and lc["spec_id"] == spec_id:
+            st.success(f"Total Bear Rally setups found: {lc['cnt']}")
+            st.caption("Setup count is based on entry criteria only (no trade management). Requires a valid initial stop per spec.")
+            st.write(f"Scanned window (UTC): {lc['s']} → {lc['e']}")
 
-        #required = {"strategy_name","symbol","entry_tf","entry_ts_utc","entry_price","stop_price"}
-        required_base = {"strategy_name","symbol","entry_tf","entry_price","stop_price"}
-        has_est = "entry_ts_est" in df.columns
-        has_utc = "entry_ts_utc" in df.columns
-        missing_base = required_base - set(df.columns)
+        # Slider should ALWAYS exist
+        max_setups = st.slider(
+            "How many setups to scan (first N found)",
+            min_value=5,
+            max_value=500,
+            value=50,
+            step=5
+        )
 
-        if missing_base:
-            st.error(f"Missing required columns: {sorted(list(missing_base))}")
-        elif not (has_est or has_utc):
-            st.error("Missing timestamp column. Provide either 'entry_ts_est' (preferred) or 'entry_ts_utc'.")
-        else:
-            pass  # continue
-
-        missing = required_base - set(df.columns)
-        if missing:
-            st.error(f"Missing required columns: {sorted(list(missing))}")
-        else:
-            # Insert into signals_v2 (dedupe by exact timestamp per strategy/symbol/tf)
-            rows = []
-            for _, r in df.iterrows():
-                ts_input = str(r["entry_ts_est"]) if "entry_ts_est" in df.columns else str(r["entry_ts_utc"])
-                ts_utc = est_to_utc_str(ts_input) if times_entered_in_est else ts_input
-
-                rows.append((
-                    str(r["strategy_name"]),
-                    str(r["symbol"]),
-                    str(r["entry_tf"]),
-                    ts_utc,
-                    float(r["entry_price"]),
-                    float(r["stop_price"]),
-                    str(r.get("notes",""))
-                ))
+        # ---- Run button ----
+        if "is_backtest_running" not in st.session_state:
+            st.session_state["is_backtest_running"] = False
+        if st.button("Run Bear Rally backtest now", disabled=st.session_state["is_backtest_running"]):
+            st.session_state["is_backtest_running"] = True
+            st.session_state["last_run_status"] = "Starting backtest..."
             
-            conn.executemany("""
-                INSERT INTO signals_v2(strategy_name,symbol,entry_tf,entry_ts_utc,entry_price,stop_price,notes)
-                VALUES (?,?,?,?,?,?,?)
-            """, rows)
+            status = st.empty()
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            def progress_cb(p):
+                msg = p.get("msg", "")
+                status_text.info(msg)
+                if "done" in p and "total" in p and p["total"] > 0:
+                    pct = int(100 * p["done"] / p["total"])
+                    progress_bar.progress(min(max(pct, 0), 100))
+
+            try:
+                with st.spinner("Running backtest..."):
+                    status.info(st.session_state["last_run_status"])
+            
+                    grid, setups = run_bear_rally_backtest(
+                        conn=conn,
+                        symbol=symbol,
+                        spec=spec,
+                        max_setups=max_setups,
+                        progress_cb=progress_cb
+                    )
+
+                st.session_state["last_grid"] = grid
+                st.session_state["last_setups"] = setups
+                st.success(f"Backtest complete. Setups used: {len(setups)}")
+
+            except Exception as e:
+                st.error(f"Backtest failed: {e}")
+
+            finally:
+                st.session_state["is_backtest_running"] = False
+                st.status.empty()
+                status_text.empty()
+                progress_bar.empty()
+                
+            import datetime, json
+
+            created_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            winner = grid.iloc[0].to_dict() if len(grid) else {}
+
+            conn.execute(
+                """
+                INSERT INTO backtest_runs(
+                created_at_utc,
+                strategy_file_id,
+                spec_id,
+                spec_name,
+                symbol,
+                entry_tf,
+                trail_tf,
+                max_setups,
+                starting_equity,
+                risk_pct,
+                results_json,
+                setups_json,
+                winner_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                created_at,
+                spec.get("source_strategy_file_id"),
+                spec.get("_spec_id", None),
+                spec.get("_spec_name", ""),
+                symbol,
+                spec["strategy_fields"]["entry_timeframe"],
+                spec["strategy_fields"]["trail_timeframe"],
+                int(max_setups),
+                float(4000.0),
+                float(0.01),
+                grid.to_json(orient="records"),
+                setups.to_json(orient="records"),
+                json.dumps(winner),
+                )
+            )
             conn.commit()
-            st.success(f"Inserted {len(rows)} signals into signals_v2.")
+            st.success("Backtest saved to history.")
+            progress_bar.empty()
+            status_text.empty()
+            
 
-    st.markdown("### Next")
-    st.info("Next step: wire the Bear Rally exit grid (BE on touch + PSAR trail on 15m + targets + time exits), using these stored signals.")
+        # ---- Persisted results display (always) ----
+        if "last_setups" in st.session_state and "last_grid" in st.session_state:
+            st.markdown("### Setups found (first N)")
+            st.dataframe(st.session_state["last_setups"], use_container_width=True)
 
+            st.markdown("### Results (sorted by Profit%) — winner is row 1")
+            st.dataframe(st.session_state["last_grid"].head(50), use_container_width=True)
+
+            st.download_button(
+                "Download full results as CSV",
+                data=st.session_state["last_grid"].to_csv(index=False).encode("utf-8"),
+                file_name=f"{symbol}_BearRally_results_spec{spec_id}.csv",
+                mime="text/csv"
+            )
+
+            st.markdown("## Backtest History")
+
+            # Filters
+            col1, col2 = st.columns(2)
+            with col1:
+                hist_symbol = st.selectbox("Filter by symbol", ["(All)", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"], index=0)
+            with col2:
+                hist_spec = st.selectbox("Filter by spec", ["(All)"] + [f"{r[0]} — {r[1]}" for r in specs], index=0)
+
+            where = []
+            params = []
+
+            if hist_symbol != "(All)":
+                where.append("symbol=?")
+                params.append(hist_symbol)
+
+            if hist_spec != "(All)":
+                hist_spec_id = int(hist_spec.split("—")[0].strip())
+                where.append("spec_id=?")
+                params.append(hist_spec_id)
+
+            where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+            rows = conn.execute(f"""
+                SELECT run_id, created_at_utc, spec_name, symbol, entry_tf, trail_tf, max_setups
+                FROM backtest_runs
+                {where_sql}
+                ORDER BY run_id DESC
+                LIMIT 200
+            """, params).fetchall()
+
+            import pandas as pd
+            if rows:
+                df_runs = pd.DataFrame(rows, columns=["run_id","created_at_utc","spec_name","symbol","entry_tf","trail_tf","max_setups"])
+                st.dataframe(df_runs, use_container_width=True)
+
+                run_id = st.selectbox("View run_id", df_runs["run_id"].tolist())
+                one = conn.execute("""
+                    SELECT results_json, setups_json, winner_json
+                    FROM backtest_runs
+                    WHERE run_id=?
+                """, (run_id,)).fetchone()
+
+                if one:
+                    results_df = pd.read_json(one[0])
+                    setups_df = pd.read_json(one[1]) if one[1] else pd.DataFrame()
+                    st.markdown("### Saved Results (top 50)")
+                    st.dataframe(results_df.head(50), use_container_width=True)
+                    st.markdown("### Saved Setups (top 50)")
+                    st.dataframe(setups_df.head(50), use_container_width=True)
+
+                    st.download_button(
+                        "Download this run (results) as CSV",
+                        data=results_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"backtest_run_{run_id}_results.csv",
+                        mime="text/csv"
+                    )
+
+                    if st.button("Delete this run"):
+                        conn.execute("DELETE FROM backtest_runs WHERE run_id=?", (run_id,))
+                        conn.commit()
+                        st.success("Deleted run.")
+                        st.rerun()
+            else:
+                st.info("No backtest runs saved yet.")
 conn.close()

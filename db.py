@@ -71,6 +71,52 @@ CREATE TABLE IF NOT EXISTS signals_v2 (
 
 CREATE INDEX IF NOT EXISTS idx_signals_v2_lookup
 ON signals_v2(strategy_name, symbol, entry_tf, entry_ts_utc);
+
+CREATE TABLE IF NOT EXISTS strategy_specs (
+  spec_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  strategy_file_id  INTEGER NOT NULL,
+  spec_name         TEXT NOT NULL,          -- e.g., "Bear Rally v1"
+  spec_json         TEXT NOT NULL,          -- machine-readable rules
+  created_at_utc    TEXT NOT NULL,
+  FOREIGN KEY(strategy_file_id) REFERENCES strategy_files(strategy_file_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_specs_file
+ON strategy_specs(strategy_file_id);
+
+CREATE TABLE IF NOT EXISTS backtest_runs (
+  run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at_utc TEXT NOT NULL,
+
+  strategy_file_id INTEGER,
+  spec_id INTEGER,
+  spec_name TEXT,
+
+  symbol TEXT NOT NULL,
+  entry_tf TEXT,
+  trail_tf TEXT,
+
+  max_setups INTEGER,
+  starting_equity REAL,
+  risk_pct REAL,
+
+  results_json TEXT NOT NULL,      -- full grid dataframe rows as json
+  setups_json TEXT,                -- setups dataframe rows as json (optional)
+  winner_json TEXT                 -- best row as json (optional)
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_symbol
+ON backtest_runs(symbol);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_spec
+ON backtest_runs(spec_id);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_symbol_spec
+ON backtest_runs(symbol, spec_id);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_created
+ON backtest_runs(created_at_utc);
+
 """
 
 def connect(db_path: str) -> sqlite3.Connection:
