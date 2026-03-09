@@ -640,7 +640,7 @@ with tab5:
 
             def tf_to_minutes(tf: str) -> int | None:
                 ert '1m','5m','15m','30m','1H','2H','4H','1D','1W','1M' to minutes."""
-                if tf is None:
+"""          if tf is None:
                     return None
                 tf = str(tf).strip()
                 m = tf.lower()
@@ -660,7 +660,7 @@ with tab5:
                 return None
 
             def split_constant_columns(df: pd.DataFrame, exclude: set[str] | None = None):
-                """Return (constants_dict, df_without_constant_cols)."""
+                Return (constants_dict, df_without_constant_cols).
                 exclude = exclude or set()
                 constants = {}
                 keep_cols = []
@@ -950,13 +950,13 @@ with tab5:
 
             where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
-            rows = conn.execute(f"""
+            rows = conn.execute(f
                 SELECT run_id, created_at_utc, spec_name, symbol, entry_tf, trail_tf, max_setups
                 FROM backtest_runs
                 {where_sql}
                 ORDER BY run_id DESC
                 LIMIT 200
-            """, params).fetchall()
+            , params).fetchall()
 
             import pandas as pd
             if rows:
@@ -964,11 +964,7 @@ with tab5:
                 st.dataframe(df_runs, use_container_width=True)
 
                 run_id = st.selectbox("View run_id", df_runs["run_id"].tolist())
-                one = conn.execute("""
-                    SELECT results_json, setups_json, winner_json
-                    FROM backtest_runs
-                    WHERE run_id=?
-                """, (run_id,)).fetchone()
+                one = conn.execute(, (run_id,)).fetchone()
 
                 if one:
                     results_df = pd.read_json(one[0])
