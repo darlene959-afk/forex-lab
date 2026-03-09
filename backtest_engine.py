@@ -25,7 +25,7 @@ def last_row_at_or_before(df: pd.DataFrame, t: pd.Timestamp) -> pd.Series | None
         return None
     return df.iloc[int(idx)]
 
-def find_bear_rally_v2_setups(
+def find_strategy_setups(
     df1: pd.DataFrame,
     df15: pd.DataFrame,
     dfD: pd.DataFrame,
@@ -66,12 +66,19 @@ def find_bear_rally_v2_setups(
         if not confirm_bear:
             continue
 
-        # Rally condition: >= min_bull bullish candles in the window before confirmation
+
+        # Rally condition: >= min_bull bullish candles AND price must have risen
         w_start = max(0, (i - 1) - lookback)
         rally_window = d.iloc[w_start:(i - 1)]
+        
         bull_count = int((rally_window["close"] > rally_window["open"]).sum())
-        if bull_count < min_bull:
+        
+        # FIX: Ensure price at the end of the rally is higher than at the start
+        price_risen = rally_window["close"].iloc[-1] > rally_window["open"].iloc[0]
+        
+        if bull_count < min_bull or not price_risen:
             continue
+
 
         # Trend filters at trigger time
         rowD = last_row_at_or_before(dfD, t)
@@ -113,11 +120,51 @@ def find_bear_rally_v2_setups(
 def sma(series: pd.Series, n: int) -> pd.Series:
     return series.rolling(n, min_periods=n).mean()
 
+
+from numba import jit
+
+@jit(nopython=True)
+def _psar_fast(h, l, step, max_af):
+    n = len(h)
+    sar = np.full(n, np.nan)
+    bull = True
+    af = step
+    ep = h[0]
+    sar[0] = l[0]
+
+    for i in range(1, n):
+        prev_sar = sar[i-1]
+        sar_i = prev_sar + af * (ep - prev_sar)
+        if bull:
+            sar_i = min(sar_i, l[i-1], l[i-2] if i >= 2 else l[i-1])
+            if l[i] < sar_i:
+                bull = False
+                sar_i, ep, af = ep, l[i], step
+            else:
+                if h[i] > ep:
+                    ep = h[i]
+                    af = min(af + step, max_af)
+        else:
+            sar_i = max(sar_i, h[i-1], h[i-2] if i >= 2 else h[i-1])
+            if h[i] > sar_i:
+                bull = True
+                sar_i, ep, af = ep, h[i], step
+            else:
+                if l[i] < ep:
+                    ep = l[i]
+                    af = min(af + step, max_af)
+        sar[i] = sar_i
+    return sar
+
 def psar(high: pd.Series, low: pd.Series, step=0.02, max_af=0.2) -> pd.Series:
-    """
-    Parabolic SAR with TradingView-style defaults.
-    Returns SAR values aligned to input index.
-    """
+    vals = _psar_fast(high.to_numpy(float), low.to_numpy(float), step, max_af)
+    return pd.Series(vals, index=high.index)
+
+""" def psar(high: pd.Series, low: pd.Series, step=0.02, max_af=0.2) -> pd.Series:
+    
+    #Parabolic SAR with TradingView-style defaults.
+    #Returns SAR values aligned to input index.
+    
     h = high.to_numpy(float)
     l = low.to_numpy(float)
     n = len(h)
@@ -161,19 +208,35 @@ def psar(high: pd.Series, low: pd.Series, step=0.02, max_af=0.2) -> pd.Series:
         sar[i] = sar_i
 
     return pd.Series(sar, index=high.index)
-
+ """
 # ---------------- SQLite helpers ----------------
 
-def load_bars(conn, symbol: str, tf: str, start_utc: str, end_utc: str) -> pd.DataFrame:
-    q = """
-    SELECT ts_utc, open, high, low, close
+
+#def load_bars(conn, symbol: str, tf: str, start_utc: str, end_utc: str) -> pd.DataFrame:
+ #   q = """
+ #   SELECT ts_utc, open, high, low, close
+ #   FROM bars
+ #   WHERE symbol=? AND timeframe=? AND ts_utc>=? AND ts_utc<=?
+ #   ORDER BY ts_utc ASC
+ #   """
+ #   df = pd.read_sql_query(q, conn, params=(symbol, tf, start_utc, end_utc))
+ #   df["ts_utc"] = pd.to_datetime(df["ts_utc"])
+ #   return df
+
+
+def load_bars(conn, symbol: str, tf: str, start_utc: str, end_utc: str, columns=None) -> pd.DataFrame:
+    col_str = "*" if columns is None else ", ".join(columns)
+    q = f"""
+    SELECT {col_str}
     FROM bars
     WHERE symbol=? AND timeframe=? AND ts_utc>=? AND ts_utc<=?
     ORDER BY ts_utc ASC
     """
     df = pd.read_sql_query(q, conn, params=(symbol, tf, start_utc, end_utc))
-    df["ts_utc"] = pd.to_datetime(df["ts_utc"])
+    if "ts_utc" in df.columns:
+        df["ts_utc"] = pd.to_datetime(df["ts_utc"])
     return df
+
 
 def get_bar_window(conn, symbol: str, tf: str) -> tuple[str | None, str | None]:
     q = """
@@ -231,7 +294,7 @@ def winrate_moe_95(p: float, n: int) -> float:
 
 
 # ---------------- Backtest core ----------------
-def run_bear_rally_backtest(
+def run_backtest(
     conn,
     symbol: str,
     spec: dict,
@@ -291,7 +354,7 @@ def run_bear_rally_backtest(
     df1["pivH"] = pivot_high_flags(df1["high"], left=2, right=2)
 
     # Find Bear Rally v2 setups
-    setups = find_bear_rally_v2_setups(
+    setups = find_strategy_setups(
     df1=df1,
     df15=df15,
     dfD=dfD,
@@ -537,7 +600,7 @@ def run_bear_rally_backtest(
     _progress("Backtest complete. Rendering results…", total_cfg, total_cfg)
     return grid, setups
 
-def count_bear_rally_setups_all(conn, symbol: str, spec: dict) -> tuple[int, str, str]:
+def count_strategy_setups_all(conn, symbol: str, spec: dict) -> tuple[int, str, str]:
     """
     Count all Bear Rally v2 setups over the full overlapping window (1H + 15m + 1D).
     Returns (count, start_utc_str, end_utc_str).
@@ -569,5 +632,5 @@ def count_bear_rally_setups_all(conn, symbol: str, spec: dict) -> tuple[int, str
     df1["psar"] = psar(df1["high"], df1["low"], step=psar_step, max_af=psar_max)
     df15["psar"] = psar(df15["high"], df15["low"], step=psar_step, max_af=psar_max)
 
-    setups = find_bear_rally_v2_setups(df1, df15, dfD, spec, max_setups=10**12)
+    setups = find_strategy_setups(df1, df15, dfD, spec, max_setups=10**12)
     return int(len(setups)), start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")

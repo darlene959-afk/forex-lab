@@ -33,15 +33,28 @@ DB_PATH = "forex.db"
 st.set_page_config(page_title="Forex Lab", layout="wide")
 st.title("Forex Lab — MT5 Data + Strategy Library")
 
-conn = connect(DB_PATH)
-init_db(conn)
+@st.cache_resource
+def get_connection():
+    """Creates a single persisted connection to the SQLite database
+     Streamlite will reuse this object across all reruns and sessions.
+     """
+    c = connect(DB_PATH)
+    init_db(c) #initialize tables if not exist
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    return c
+
+#Now use the cached function to get the connection
+conn = get_connection()
+
+
+
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Upload Market Data",
     "Upload Strategy PDF/DOCX",
     "Database Overview",
     "Strategy Viewer",
-    "Backtest"
+    "Backtest",
+    "Help"
 ])
 
 with tab1:
@@ -178,12 +191,9 @@ with tab3:
 
     if st.button("Create backup now"):
         try:
-            # Make sure DB is flushed/closed before backup call
-            conn.close()
+            
             backup_db(DB_PATH, backup_path)
-            # Re-open for rest of app
-            conn = connect(DB_PATH)
-            init_db(conn)
+            
 
             with open(backup_path, "rb") as f:
                 st.download_button("Download backup file", data=f, file_name=backup_name)
@@ -423,7 +433,7 @@ with tab4:
 
 with tab5:
     import pandas as pd
-    from backtest_engine import run_bear_rally_backtest
+    from backtest_engine import run_backtest
 
   
     # Select spec (for now we use it as the record of settings/version)
@@ -474,12 +484,36 @@ with tab5:
         # Pair selection
         symbol = st.selectbox("Symbol", ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"], index=0)
 
-        from backtest_engine import count_bear_rally_setups_all
+        with st.expander("What is being tested? (configs grid breakdown)", expanded=False):
+            be_levels = spec["strategy_fields"]["be_move"]["candidates_r"]
+            targets = spec["strategy_fields"]["targets"]["tested_target_r"]
+            holds = spec["strategy_fields"]["time_exits"]["entry_tf_bars"]
+
+            # Count holds excluding the "Hold" label if present
+            num_holds = len(holds)
+            num_be = len(be_levels) + 1  # +1 for "None" (no BE move)
+            num_targets = len(targets)
+
+            total_cfg = num_be * num_targets * num_holds
+
+            st.markdown(f"""
+        **A configuration (config)** is one combination of:
+        - **BE rule**: None + {be_levels}R  → **{num_be} options**
+        - **Target_R**: {targets} → **{num_targets} options**
+        - **Max Hold (bars)**: {holds} → **{num_holds} options**
+
+        **Total configs simulated** = {num_be} × {num_targets} × {num_holds} = **{total_cfg}**
+        """)
+            st.caption("Each config is tested on the same set of detected setups (first N found).")
+
+
+
+        from backtest_engine import count_strategy_setups_all
 
         # ---- Count button ----
-        if st.button("Count all Bear Rally setups in full dataset window"):
+        if st.button("Count all strategy setups in full dataset window"):
             try:
-                cnt, s_utc, e_utc = count_bear_rally_setups_all(conn, symbol, spec)
+                cnt, s_utc, e_utc = count_strategy_setups_all(conn, symbol, spec)
                 st.session_state["last_count"] = {
                     "cnt": cnt, "s": s_utc, "e": e_utc,
                     "symbol": symbol, "spec_id": spec_id
@@ -490,7 +524,7 @@ with tab5:
         # ---- Persisted count display (always) ----
         lc = st.session_state.get("last_count")
         if lc and lc["symbol"] == symbol and lc["spec_id"] == spec_id:
-            st.success(f"Total Bear Rally setups found: {lc['cnt']}")
+            st.success(f"Total strategy setups found: {lc['cnt']}")
             st.caption("Setup count is based on entry criteria only (no trade management). Requires a valid initial stop per spec.")
             st.write(f"Scanned window (UTC): {lc['s']} → {lc['e']}")
 
@@ -503,29 +537,72 @@ with tab5:
             step=5
         )
 
-        # ---- Run button ----
+        # ---- Run button (robust disable + persistent progress) ----
         if "is_backtest_running" not in st.session_state:
             st.session_state["is_backtest_running"] = False
-        if st.button("Run Bear Rally backtest now", disabled=st.session_state["is_backtest_running"]):
+        if "progress_msg" not in st.session_state:
+            st.session_state["progress_msg"] = ""
+        if "progress_done" not in st.session_state:
+            st.session_state["progress_done"] = 0
+        if "progress_total" not in st.session_state:
+            st.session_state["progress_total"] = 0
+        if "run_nonce" not in st.session_state:
+            st.session_state["run_nonce"] = 0
+        if "run_nonce_completed" not in st.session_state:
+            st.session_state["run_nonce_completed"] = -1
+
+       
+        if st.button("Run backtest now"):
             st.session_state["is_backtest_running"] = True
-            st.session_state["last_run_status"] = "Starting backtest..."
-            
-            status = st.empty()
             progress_bar = st.progress(0)
             status_text = st.empty()
 
+            try:
+                #Pass a callback to update progress from the backtest engine
+                def update_ui(p):
+                    status_text.text(p.get("msg", "Running backtest..."))
+                    if "done" in p and "total" in p: 
+                        pct = int(100 * p["done"] / p["total"])
+                        progress_bar.progress(min(max(pct, 0), 100))
+             
+                        grid, setups = run_backtest(conn, symbol, spec, progress_cb=update_ui)
+                        st.session_state["results"] = (grid)
+                        st.success("Backtest Completed!")
+
+           
+
+            except Exception as e:
+                st.error(f"Backtest failed: {str(e)}")
+            finally:
+                #This always runs even if there is an error, ensuring the UI resets properly
+                st.session_state["is_backtest_running"] = False
+                progress_bar.empty() #Clear the progress bar
+                status_text.empty()
+"""        # Show progress if running
+        progress_bar = None
+        if st.session_state["is_backtest_running"]:
+            st.info(st.session_state.get("progress_msg", "Running backtest..."))
+            progress_bar = st.progress(0)
+            done = st.session_state.get("progress_done", 0)
+            total = st.session_state.get("progress_total", 0)
+            if total and total > 0:
+                pct = int(100 * done / total)
+                progress_bar.progress(min(max(pct, 0), 100))
+
+        # Run the backtest only once per nonce
+        if (st.session_state["is_backtest_running"] and st.session_state["run_nonce_completed"] != st.session_state["run_nonce"]
+        ):
+
             def progress_cb(p):
                 msg = p.get("msg", "")
-                status_text.info(msg)
+                st.session_state["progress_msg"] = msg
                 if "done" in p and "total" in p and p["total"] > 0:
-                    pct = int(100 * p["done"] / p["total"])
-                    progress_bar.progress(min(max(pct, 0), 100))
+                    st.session_state["progress_done"] = int(p["done"])
+                    st.session_state["progress_total"] = int(p["total"])
 
             try:
                 with st.spinner("Running backtest..."):
-                    status.info(st.session_state["last_run_status"])
-            
-                    grid, setups = run_bear_rally_backtest(
+                    grid, setups = run_backtest(
                         conn=conn,
                         symbol=symbol,
                         spec=spec,
@@ -535,76 +612,320 @@ with tab5:
 
                 st.session_state["last_grid"] = grid
                 st.session_state["last_setups"] = setups
-                st.success(f"Backtest complete. Setups used: {len(setups)}")
+                st.session_state["run_nonce_completed"] = st.session_state["run_nonce"]
 
+                #st.success(f"Backtest complete. Setups used: {len(setups)}")
+                st.session_state["last_run_success"] = f"Backtest complete. Setups used: {len(setups)}"
+"""
+
+"""
             except Exception as e:
-                st.error(f"Backtest failed: {e}")
+                #st.error(f"Backtest failed: {e}") 
+                st.session_state["last_run_error"] = f"Backtest failed: {e}"
 
             finally:
                 st.session_state["is_backtest_running"] = False
-                st.status.empty()
-                status_text.empty()
-                progress_bar.empty()
-                
-            import datetime, json
+                #st.session_state["progress_msg"] = ""
+                #st.session_state["progress_done"] = 0
+                #st.session_state["progress_total"] = 0
+                st.session_state["run_nonce"] += 1
+   """                 
+"""
+            # Move “identical columns” into the title (don’t change DB)
+            # We’ll detect columns where all rows have the same value (e.g., symbol, strategy, entry_tf, trail_tf, maybe setups) and:
+            # show them as a header block
+            # drop them from the displayed table only
+            import pandas as pd
+            import numpy as np
 
-            created_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            winner = grid.iloc[0].to_dict() if len(grid) else {}
+            def tf_to_minutes(tf: str) -> int | None:
+                ert '1m','5m','15m','30m','1H','2H','4H','1D','1W','1M' to minutes."""
+                if tf is None:
+                    return None
+                tf = str(tf).strip()
+                m = tf.lower()
+                if m.endswith("m") and m[:-1].isdigit():
+                    return int(m[:-1])
+                if m.endswith("h") and m[:-1].isdigit():
+                    return int(m[:-1]) * 60
+                if m == "1d":
+                    return 1440
+                if m == "1w":
+                    return 10080
+                if m == "1m":  # month is ambiguous; you likely mean Monthly timeframe
+                    # If you store Monthly as "1M" already, handle below:
+                    return 43200  # 30 days approx (only for display; not used for intraday)
+                if tf == "1M":  # Monthly
+                    return 43200
+                return None
 
-            conn.execute(
-                """
-                INSERT INTO backtest_runs(
-                created_at_utc,
-                strategy_file_id,
-                spec_id,
-                spec_name,
-                symbol,
-                entry_tf,
-                trail_tf,
-                max_setups,
-                starting_equity,
-                risk_pct,
-                results_json,
-                setups_json,
-                winner_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                created_at,
-                spec.get("source_strategy_file_id"),
-                spec.get("_spec_id", None),
-                spec.get("_spec_name", ""),
-                symbol,
-                spec["strategy_fields"]["entry_timeframe"],
-                spec["strategy_fields"]["trail_timeframe"],
-                int(max_setups),
-                float(4000.0),
-                float(0.01),
-                grid.to_json(orient="records"),
-                setups.to_json(orient="records"),
-                json.dumps(winner),
-                )
-            )
-            conn.commit()
-            st.success("Backtest saved to history.")
-            progress_bar.empty()
-            status_text.empty()
-            
+            def split_constant_columns(df: pd.DataFrame, exclude: set[str] | None = None):
+                """Return (constants_dict, df_without_constant_cols)."""
+                exclude = exclude or set()
+                constants = {}
+                keep_cols = []
+                for c in df.columns:
+                    if c in exclude:
+                        keep_cols.append(c)
+                        continue
+                    s = df[c]
+                    # treat NaN-only as non-constant (keep it)
+                    non_na = s.dropna()
+                    if len(non_na) > 0 and non_na.nunique() == 1:
+                        constants[c] = non_na.iloc[0]
+                    else:
+                        keep_cols.append(c)
+                return constants, df[keep_cols].copy()
+
+            def add_derived_time_columns(df: pd.DataFrame) -> pd.DataFrame:
+                d = df.copy()
+
+                # Entry TF minutes for conversions
+                entry_tf = None
+                if "entry_tf" in d.columns:
+                    # after constant split, entry_tf might be gone; handle both cases
+                    if d["entry_tf"].dropna().nunique() == 1:
+                        entry_tf = str(d["entry_tf"].dropna().iloc[0])
+                # We'll also accept entry_tf passed in via constants externally.
+                return d
+        
+        if st.session_state.get("last_run_error"):
+            st.error(st.session_state["last_run_error"])
+        elif st.session_state.get("last_run_success"):
+            st.success(st.session_state["last_run_success"])
+
 
         # ---- Persisted results display (always) ----
         if "last_setups" in st.session_state and "last_grid" in st.session_state:
             st.markdown("### Setups found (first N)")
             st.dataframe(st.session_state["last_setups"], use_container_width=True)
 
-            st.markdown("### Results (sorted by Profit%) — winner is row 1")
-            st.dataframe(st.session_state["last_grid"].head(50), use_container_width=True)
+
+            # cleaner title
+            # row numbering starts at 1 for user-friendliness (not 0)
+
+
+            grid = st.session_state["last_grid"].copy()
+
+            # Detect constant columns (same value for every row)
+            constant_cols = [c for c in grid.columns if grid[c].nunique() == 1]
+
+            constants = {c: grid[c].iloc[0] for c in constant_cols}
+
+            # Remove constant columns from display table
+            display_df = grid.drop(columns=constant_cols)
+
+            # Create user-friendly header
+            header_parts = []
+            for k, v in constants.items():
+                header_parts.append(f"{k}: {v}")
+
+            header_text = " | ".join(header_parts)
+
+            st.markdown("### Results (sorted by Profit%)")
+            st.caption(header_text)
+
+            # Add ranking column starting at 1
+            display_df = display_df.reset_index(drop=True)
+            display_df.insert(0, "Rank", display_df.index + 1)
+
+            # headers will look like normal English and hovering over them
+            # will explain exactly what they mean (no more guessing R% vs Win Rate% vs Target Hit% etc). We want to show the most important metrics in the table and hide less important ones in the tooltip to avoid overwhelming users with info. The tooltip also allows us to explain complex metrics without cluttering the display.
+
+            import numpy as np
+            import streamlit as st
+
+            # ---------------- Derived time columns ----------------
+            def tf_to_minutes(tf: str) -> int | None:
+                tf = str(tf).strip()
+                t = tf.lower()
+                if t.endswith("m") and t[:-1].isdigit():
+                    return int(t[:-1])
+                if t.endswith("h") and t[:-1].isdigit():
+                    return int(t[:-1]) * 60
+                if t == "1d":
+                    return 1440
+                if t == "1w":
+                    return 10080
+                if tf == "1M":  # monthly (approx)
+                    return 43200
+                return None
+
+            entry_tf = str(constants.get("entry_tf", "")).strip()
+            tf_min = tf_to_minutes(entry_tf) if entry_tf else None
+            bars_per_day = (1440 / tf_min) if tf_min and tf_min > 0 else None
+
+            # Add Max Hold Days (for numeric bars)
+            if bars_per_day and "max_hold_bars" in display_df.columns:
+                def _max_hold_days(v):
+                    if isinstance(v, str) and v.lower() == "hold":
+                        return np.nan
+                    try:
+                        return float(v) / bars_per_day
+                    except:
+                        return np.nan
+                display_df["max_hold_days"] = display_df["max_hold_bars"].apply(_max_hold_days)
+
+            # Add Avg Days Held
+            if bars_per_day and "avg_bars_held" in display_df.columns:
+                display_df["avg_days_held"] = display_df["avg_bars_held"].apply(lambda x: (float(x) / bars_per_day) if float(x) > 0 else np.nan)
+
+            # Profit% per Bar
+            if "profit_%" in display_df.columns and "avg_bars_held" in display_df.columns:
+                display_df["profit_%_per_bar"] = display_df.apply(
+                    lambda r: (float(r["profit_%"]) / float(r["avg_bars_held"])) if float(r["avg_bars_held"]) > 0 else np.nan,
+                    axis=1
+                )
+
+            # Profit% per Day
+            if "profit_%" in display_df.columns and "avg_days_held" in display_df.columns:
+                display_df["profit_%_per_day"] = display_df.apply(
+                    lambda r: (float(r["profit_%"]) / float(r["avg_days_held"])) if float(r["avg_days_held"]) > 0 else np.nan,
+                    axis=1
+                )
+
+            # ---------------- Friendly names + tooltips ----------------
+            LABELS = {
+                "stop_hit_count": "Stops Hit (#)",
+                "stop_hit_%": "Stops Hit (%)",
+                "target_hit_count": "Targets Hit (#)",
+                "target_hit_%": "Targets Hit (%)",
+                "time_exit_count": "Time Exits (#)",
+                "time_exit_%": "Time Exits (%)",
+                "be_touch_R": "BE Move (R)",
+                "target_R": "Target (R)",
+                "max_hold_bars": "Max Hold (Bars)",
+                "max_hold_days": "Max Hold (Days)",
+                "setups": "Trades Tested (#)",
+                "profit_%": "Profit (%)",
+                "win_rate_%": "Win Rate (%)",
+                "win_rate_MOE95_%": "Win Rate MOE (95%)",
+                "avg_bars_held": "Avg Hold (Bars)",
+                "avg_days_held": "Avg Hold (Days)",
+                "profit_%_per_bar": "Profit% / Bar",
+                "profit_%_per_day": "Profit% / Day",
+                "max_DD_%": "Max Drawdown (%)",
+            }
+
+            HELP = {
+                "Stops Hit (#)": "Number of trades that exited via stop-loss (touch execution).",
+                "Stops Hit (%)": "Percent of trades that exited via stop-loss (touch execution).",
+                "Targets Hit (#)": "Number of trades that hit the profit target (touch execution).",
+                "Targets Hit (%)": "Percent of trades that hit the profit target (touch execution).",
+                "Time Exits (#)": "Trades closed because the max-hold limit was reached (neither stop nor target hit first).",
+                "Time Exits (%)": "Percent of trades closed by max-hold time exit.",
+                "BE Move (R)": "Break-even move threshold. When MFE touches this R level, stop is moved to entry. 'None' means no BE move.",
+                "Target (R)": "Profit target measured in R (initial risk units). Example: 2R = profit = 2 × initial risk.",
+                "Max Hold (Bars)": "Maximum holding time in entry-timeframe bars. 'Hold' means no forced time exit.",
+                "Max Hold (Days)": "Max hold converted from bars to days using the entry timeframe (e.g., 1H bars ÷ 24).",
+                "Trades Tested (#)": "How many trades (setups) were included in this run for this config.",
+                "Profit (%)": "Total compounded percent return on equity for this configuration across all tested trades.",
+                "Win Rate (%)": "Percent of trades that ended positive (target hit or profitable time exit).",
+                "Win Rate MOE (95%)": "95% margin of error for Win Rate. Smaller is better; improves with more trades tested.",
+                "Avg Hold (Bars)": "Average number of entry-timeframe bars the trade was held before exit.",
+                "Avg Hold (Days)": "Avg Hold converted to days based on entry timeframe.",
+                "Profit% / Bar": "Profit (%) divided by Avg Hold (Bars). Higher = more profit per unit time (bars).",
+                "Profit% / Day": "Profit (%) divided by Avg Hold (Days). Higher = more profit per unit time (days).",
+                "Max Drawdown (%)": "Worst peak-to-trough equity decline during the run (equity curve drawdown).",
+            }
+
+            # Rename columns for display only
+            display_df_ui = display_df.rename(columns=LABELS)
+
+            # Build column_config tooltips
+            colcfg = {}
+            for col in display_df_ui.columns:
+                if col in HELP:
+                    if col.endswith("(%)") or col.endswith("Profit (%)") or col.endswith("Win Rate (%)") or col.endswith("Max Drawdown (%)"):
+                        colcfg[col] = st.column_config.NumberColumn(help=HELP[col], format="%.2f")
+                    elif col.endswith("(#)"):
+                        colcfg[col] = st.column_config.NumberColumn(help=HELP[col], format="%.0f")
+                    else:
+                        colcfg[col] = st.column_config.NumberColumn(help=HELP[col])
+
+            # Show table
+
+            # ---------------- Filters (fast decision-making) ----------------
+            st.markdown("### Filters")
+
+            fcol1, fcol2, fcol3 = st.columns(3)
+
+            with fcol1:
+                min_trades = st.number_input(
+                    "Min trades tested",
+                    min_value=1,
+                    value=50,
+                    step=10,
+                    help="Hide configs tested on too few trades. Higher = more reliable."
+                )
+
+            with fcol2:
+                max_dd_cap = st.number_input(
+                    "Max drawdown cap (%)",
+                    min_value=0.0,
+                    value=50.0,
+                    step=1.0,
+                    help="Only show configs with Max Drawdown <= this value."
+                )
+
+            with fcol3:
+                min_profit_day = st.number_input(
+                    "Min Profit% / Day",
+                    min_value=-1000.0,
+                    value=0.0,
+                    step=0.1,
+                    help="Only show configs with Profit%/Day >= this value."
+                )
+
+            filtered = display_df_ui.copy()
+
+            # Apply filters safely (only if columns exist)
+            if "Trades Tested (#)" in filtered.columns:
+                filtered = filtered[filtered["Trades Tested (#)"] >= float(min_trades)]
+
+            if "Max Drawdown (%)" in filtered.columns:
+                filtered = filtered[filtered["Max Drawdown (%)"] <= float(max_dd_cap)]
+
+            if "Profit% / Day" in filtered.columns:
+                filtered = filtered[filtered["Profit% / Day"] >= float(min_profit_day)]
+
+            st.caption(f"Rows after filters: {len(filtered):,} of {len(display_df_ui):,}")
+
+
+            # ---------------- Winner summary (Rank 1 after filters) ----------------
+            st.markdown("### Winner summary (Rank 1)")
+
+            if len(filtered) == 0:
+                st.warning("No rows match the current filters.")
+            else:
+                winner = filtered.iloc[0].to_dict()
+
+                w1, w2, w3, w4 = st.columns(4)
+
+                w1.metric("Profit (%)", f"{winner.get('Profit (%)', '—'):.2f}" if isinstance(winner.get("Profit (%)"), (int,float)) else str(winner.get("Profit (%)")))
+                w2.metric("Profit% / Day", f"{winner.get('Profit% / Day', '—'):.4f}" if isinstance(winner.get("Profit% / Day"), (int,float)) else str(winner.get("Profit% / Day")))
+                w3.metric("Win Rate (%)", f"{winner.get('Win Rate (%)', '—'):.2f}" if isinstance(winner.get("Win Rate (%)"), (int,float)) else str(winner.get("Win Rate (%)")))
+                w4.metric("Max DD (%)", f"{winner.get('Max Drawdown (%)', '—'):.2f}" if isinstance(winner.get("Max Drawdown (%)"), (int,float)) else str(winner.get("Max Drawdown (%)")))
+
+                st.caption(
+                    f"Target: {winner.get('Target (R)', '—')}R | "
+                    f"BE: {winner.get('BE Move (R)', '—')} | "
+                    f"Max Hold: {winner.get('Max Hold (Bars)', '—')} bars"
+                    + (f" ({winner.get('Max Hold (Days)', '—'):.2f} days)" if isinstance(winner.get("Max Hold (Days)"), (int,float)) else "")
+                )
+
+            # Now the table respects your filters and the “winner” is the filtered Rank 1.
+            st.dataframe(filtered.head(50), use_container_width=True, column_config=colcfg)
+
+
+
 
             st.download_button(
-                "Download full results as CSV",
-                data=st.session_state["last_grid"].to_csv(index=False).encode("utf-8"),
-                file_name=f"{symbol}_BearRally_results_spec{spec_id}.csv",
+                "Download filtered results as CSV",
+                data=filtered.to_csv(index=False).encode("utf-8"),
+                file_name=f"{symbol}_BearRally_results_spec{spec_id}_filtered.csv",
                 mime="text/csv"
-            )
+        )
 
             st.markdown("## Backtest History")
 
@@ -671,4 +992,186 @@ with tab5:
                         st.rerun()
             else:
                 st.info("No backtest runs saved yet.")
+"""
+                
+                
+with tab6:
+    st.title("ForexLab Help")
+
+    #This will render the screenshots you already placed in forexlab/assets/help/.
+    import os
+
+    st.markdown("### Built-in walkthrough screenshots (saved in repo)")
+    st.caption("These images are loaded from: assets/help/ (relative to app.py).")
+
+    help_dir = os.path.join("assets", "help")
+    st.code(f"Looking for screenshots in: {os.path.abspath(help_dir)}")
+
+    walkthrough = [
+        ("1) Upload Market Data", "upload_market_data.png",
+        "Upload MT5 CSV files and import them into SQLite."),
+
+        ("2) Database Overview — Recent Imports + Strategy Files", "Database-Recent-imports-and-strategy-files.png",
+        "Confirm what data is in the database (symbols, timeframes, ranges) and review strategy uploads."),
+
+        ("3) Database Overview — Data File Uploads", "Database-Data-file-uploads.png",
+        "See the upload/import log and confirm row counts and date ranges."),
+
+        ("4) Strategy Viewer", "Strategy-Viewer.png",
+        "Load an existing spec, edit the JSON, and save a new version (v1/v2/v3…)."),
+
+        ("5) Upload Strategy Sheet", "upload_strategy_sheet.png",
+        "Upload a strategy PDF/DOCX to extract text and store it."),
+
+        ("6) Backtesting Tab", "Backtesting-tab.png",
+        "Select a spec + symbol, count setups, run the backtest, and review results."),
+
+        ("7) Help Tab Screenshot", "help-screenshot.png",
+        "Optional: the help tab screenshot you captured."),
+    ]
+
+    for title, filename, caption in walkthrough:
+        st.markdown(f"#### {title}")
+        path = os.path.join(help_dir, filename)
+        if os.path.exists(path):
+            st.image(path, use_container_width=True)
+            st.caption(caption)
+        else:
+            st.warning(f"Missing screenshot file: {path}")
+
+
+
+
+    # This gives you an immediate “drop screenshots here” experience.
+    # How you use it
+    #Take screenshots (Win+Shift+S)
+    #Upload them once
+    #They show in the Help tab
+
+    #This is a temporary quick-fix to get image in through the app and can be
+    # deleted later once we have the screenshots in the codebase. It’s not ideal but it’s a nice-to-have for now to avoid needing to hardcode image files while we iterate on the Help content.
+    #     
+    st.markdown("## Screenshots (optional)")
+    st.caption("Upload screenshots to display them in this Help page. These are stored only for this session unless you save them as files in your project.")
+
+    help_imgs = st.file_uploader(
+        "Upload Help screenshots (PNG/JPG)",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="help_screenshots_uploader"
+    )
+
+    if help_imgs:
+        st.session_state["help_screenshots"] = help_imgs
+
+    imgs = st.session_state.get("help_screenshots", [])
+    if imgs:
+        for i, img in enumerate(imgs, start=1):
+            st.markdown(f"### Screenshot {i}")
+            st.image(img, use_container_width=True)
+
+
+# This is for storing static screenshots in the codebase (e.g., assets/help/01_upload_data.png) and displaying them in the Help tab without needing to upload each time. You can replace these with your actual screenshots.
+# This is for rendering static screenshots stored in the codebase (e.g., assets/help/01_upload_data.png) in the Help tab without needing to upload each time. You can replace these with your actual screenshots.
+# This will render screenshots from your local project folder and also work in GitHub.
+import os
+
+st.markdown("## Help walkthrough (with screenshots)")
+
+help_dir = os.path.join("assets", "help")
+files = [
+    ("1) Upload MT5 Data", "upload_market_data.png", "Go to Upload Data and import your MT5 CSV files into SQLite."),
+    ("2) Strategy Viewer", "Strategy-Viewer.png", "Upload a strategy PDF/DOCX, extract text, and save a versioned spec (v1/v2/v3...)."),
+    ("3) Backtest", "03_backtest.png", "Choose spec + symbol, count setups, run backtest, review winner + download results."),
+    ("4) Backtest History", "Backtesting-tab.png", "View saved backtest runs, filter by symbol/spec, and download past results.")
+]
+
+for title, filename, caption in files:
+    st.markdown(f"### {title}")
+    path = os.path.join(help_dir, filename)
+    if os.path.exists(path):
+        st.image(path, use_container_width=True)
+        st.caption(caption)
+    else:
+        st.warning(f"Missing screenshot file: {path}")
+
+# This section is for me personally so that I can refer to it and share it with others as a quick-start guide. It’s not meant to be a polished user manual, but more of a “here’s how to get going and what to expect” overview. I can expand it over time as needed.
+
+    st.markdown("""
+### What this app does
+ForexLab lets you:
+- Import MT5 historical bar data into SQLite (multiple symbols + timeframes)
+- Store strategy PDFs/DOCX and versioned **strategy specs**
+- Detect strategy **setups** from bar data (entry criteria only)
+- Backtest **position management configurations** on those setups and compare results
+
+---
+
+## Typical workflow
+1) **Upload Data**: Import MT5 CSV files (EURUSD_M15..., EURUSD_H1..., etc.)
+2) **Strategy Viewer**: Upload a strategy PDF/DOCX → extract text → create/save a spec (v1, v2, v3...)
+3) **Backtest**: Choose a spec + symbol → count setups → run backtest → review winner + download results
+
+---
+
+## Key definitions
+### Setup
+A **setup** is a valid entry opportunity found by the strategy’s entry criteria.
+It does **not** depend on trade outcome.
+
+> Setup count is based on entry criteria only (no trade management).  
+> It also requires a valid initial stop per the spec.
+
+### R (Reward-to-Risk unit)
+**R** = (Stop − Entry) for shorts (or Entry − Stop for longs).  
+Targets like **2R** mean profit equal to 2 × the initial risk.
+
+### Execution assumptions
+- **Stops/targets execute on touch** (wick counts)
+- If stop and target are both touched inside the same higher-timeframe candle:
+  - resolve using **1m**, then **5m**, else **stop-first** (conservative)
+
+---
+
+## Backtest results: what “Simulating configs …” means
+A **config** is one combination of trade management settings applied to the same set of setups:
+
+- **BE rule**: when to move stop to breakeven (in R)
+  - example: None, 0.25R, 0.5R, 0.75R, 1.0R
+- **Target_R**: profit target multiple
+  - example: 0.5R, 1R, 1.5R, 2R, 3R, 5R
+- **Max Hold (bars)**: time exit horizon (force exit if stop/target not hit)
+  - example: Hold, 24, 48, 72, ...
+
+Total configs = **(#BE levels) × (#targets) × (#hold options)**
+
+Example:
+- BE(5) × Targets(6) × Holds(8) = 240 configs
+
+When you see “Simulating configs 70/240”, it means:
+> We’ve completed 70 different management configurations out of 240 total.
+
+---
+
+## Common metrics in the results grid
+- **profit_%**: percent change in account equity over the run (compounded)
+- **win_rate_%**: percent of trades with positive R (includes time-exit winners)
+- **win_rate_MOE95_%**: 95% margin-of-error for win rate (small samples = wider MOE)
+- **avg_bars_held**: average duration in bars
+- **max_DD_%**: maximum peak-to-trough drawdown of equity curve
+- **stop_hit_% / target_hit_% / time_exit_%**: explicit exit breakdown (if enabled)
+
+---
+
+## Tips for better statistical confidence
+- 20 setups is small → results can vary a lot.
+- 100–200 setups is better.
+- 500+ setups is strong when available.
+
+---
+
+### Troubleshooting
+- If results don’t match the selected spec name, ensure spec_id/spec_name is passed into the engine and displayed from the spec label.
+- If you change symbol/spec and see old results, clear cached session results on selection change.
+""")
 conn.close()
